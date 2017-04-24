@@ -1,13 +1,15 @@
 from bs4 import BeautifulSoup as bs
 import random, re, json, itertools
 from collections import defaultdict
+from gensim.models import KeyedVectors
 import numpy as np
 from scipy.stats import entropy
 from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.base import ClassifierMixin, TransformerMixin
 from sklearn.feature_selection import SelectKBest
 from sklearn.preprocessing import Normalizer, FunctionTransformer
-from sklearn.metrics import precision_score, recall_score
+from sklearn.metrics import precision_score, recall_score, log_loss, accuracy_score
 from functools import partial
 
 parens = re.compile(r'\([\w]+\)')
@@ -23,7 +25,7 @@ def purge(x):
     x = number.sub(' falsenumber ', x)
     return spaces.sub(' ', diactric.sub('', x).rstrip(' ').lstrip(' '))
 
-def load_and_train_test_split(keywords=['technology', 'design', 'entertainment'], train_size=.7, purify=purge):
+def load_data(keywords=['technology', 'design', 'entertainment'], purify=purge):
     with open('ted_en_kw_cont.json', 'r') as f:
         data = json.load(f)
         
@@ -36,7 +38,7 @@ def load_and_train_test_split(keywords=['technology', 'design', 'entertainment']
         
     dataset = list(zip(x, y))
     random.shuffle(dataset)
-    return dataset[:int(N*train_size)], dataset[int(N*train_size):]
+    return dataset
 
 def transform_labels_usable(y_set, keywords=['technology', 'design', 'entertainment']):
     
@@ -90,25 +92,10 @@ def calculate_lab_prob(labels):
     lab, counts = np.unique(labels, return_counts=True)
     return counts/np.sum(counts)
 
-
-def vectorize_docs(documents, word2vec, mean=True):
-    
-    vectors = []
-    indices = []
-    for i, doc in enumerate(documents):
-        
-        bag = [word2vec[x] for x in doc.split() if x in word2vec]
-        if len(bag) == 0:
-            continue
-        indices.append(i)
-        vectors.append(np.mean(bag, axis=0) if mean else np.asarray(bag))
-        
-    return np.vstack(vectors) if mean else vectors, indices
-
 def dense_transformer():
     return FunctionTransformer(lambda x: x.toarray(), accept_sparse=True)
 
-def test_score_one_vs_all(y_pred, y_true, score_func):
+def test_score_one_vs_all(y_true, y_pred, score_func):
     
     labels = np.unique(y_true)
     scores = []
@@ -122,13 +109,76 @@ def test_score_one_vs_all(y_pred, y_true, score_func):
         
     return np.asarray(scores)
 
-def get_score(pip, x_train, y_train, x_test, y_test):
-    preds = pip.predict(x_test)
-    return {'train':pip.score(x_train, y_train), 'test':pip.score(x_test, y_test), 
-            'precision':test_score_one_vs_all(preds, y_test, precision_score).mean(), 
-            'recall':test_score_one_vs_all(preds, y_test, recall_score).mean()}, pip
+def get_score(clf, X, y, cv=10):
     
-
+    N = len(X)
+    s = N//cv
+    
+    #X, y = list(map(np.asarray, [X,y]))
+    
+    scores = defaultdict(list)
+    
+    for i in range(cv):
+        
+        x_train, x_test, y_train, y_test = train_test_split(X, y)
+        
+        clf.fit(x_train, y_train)
+        pred = clf.predict(x_test)
+        probs = clf.predict_proba(x_test)
+        
+        scores['log loss'].append( log_loss( y_test, probs ) )
+        scores['accuracy'].append( accuracy_score( y_test, pred ) )
+        scores['precision'].append(test_score_one_vs_all(y_test, pred, precision_score).mean())
+        scores['recall'].append(test_score_one_vs_all(y_test, pred, recall_score).mean())
+        
+    return {k:np.mean(v) for k, v in scores.items()}
+    
+def train_mlc(vectorizer, model,  data, vocabulary, cv=10, sample_weight=None, **kwargs):
+    
+    pip = make_pipeline(vectorizer(vocabulary=vocabulary), 
+                        dense_transformer(),
+                        model(**kwargs)
+                       )
+    
+    scores = defaultdict(list)
+    X, y = data
+    C = np.asarray(y).shape[1]
+    for i in range(cv):
+        
+        x_train, x_test, y_train, y_test = train_test_split(X, y)
+        
+        logs = []
+        accs = []
+        precs = []
+        recs = []
+        
+        predictions = []
+        
+        for c in range(C):
+            
+            pip.fit(x_train, y_train[:, c])
+            pred = pip.predict(x_test)
+            probs = pip.predict_proba(x_test)
+            
+            predictions.append(pred)
+            
+            true = y_test[:, c]
+            
+            logs.append( log_loss( true, probs ) )
+            accs.append( accuracy_score( true, pred ))
+            precs.append( precision_score( true, pred ))
+            recs.append( recall_score( true, pred ))
+            
+        
+        scores['accuracy'].append( np.mean( np.prod( y_test == np.asarray(predictions).T , axis=1)).mean() )
+        scores['log loss'].append( np.mean( logs ))
+        scores['partial accuracy'].append( np.mean( accs ))
+        scores['precision'].append( np.mean( precs ))
+        scores['recall'].append( np.mean( recs ))
+        
+    return {k:np.mean(v) for k, v in scores.items()}
+    
+    
 def train_test_pipeline(vectorizer, 
                         model, 
                         data, 
@@ -141,10 +191,8 @@ def train_test_pipeline(vectorizer,
                         model(**kwargs)
                        )
     
-    x_train, y_train, x_test, y_test = data
-    
-    pip.fit(x_train, y_train)
-    return get_score(pip, x_train, y_train, x_test, y_test)
+    X, y = data
+    return get_score(pip, X, y), pip
 
 
 def feature_selection_pipeline(vectorizer, 
@@ -157,59 +205,88 @@ def feature_selection_pipeline(vectorizer,
                                sample_weight=None,
                                **kwargs):
     
-    x_train, y_train, x_test, y_test = data
     
     pip = make_pipeline(vectorizer(vocabulary=vocabulary),
                         dense_transformer(),
                         SelectKBest(selection_func, k=k),
-                        preprocessor(),
-                        model(**kwargs)
+                        preprocessor()
                        )
     
-    pip.fit(x_train, y_train, **{pip.steps[-1][0] + '__sample_weight':sample_weight})
-    return get_score(pip, x_train, y_train, x_test, y_test)
+    X, y = data
+    X = pip.fit_transform(X, y)
+    return get_score(model(**kwargs), np.asarray(X), np.asarray(y)), pip
 
-def uninformed_train_pipeline(model,
-                          data,
-                          preprocessor,
-                          sample_weight=None,
-                          **kwargs
-                             ):
+class DocVectorizer(TransformerMixin):
+    
+    def __init__(self, keys, word_counts=None, r=1e-3, mean=True, normalize=True):
+        
+        self.mean = mean
+        self.r = r
+        
+        if isinstance(keys, str):
+            
+            self.keys = KeyedVectors.load_word2vec_format(keys)
+            
+        elif isinstance(keys, KeyedVectors):
+            
+            self.keys = keys
+            
+        else:
+            
+            raise TypeError('give me KeyedVectors object or name of file')
+            
+        if word_counts is not None:
+            words_sum = sum(word_counts.values())
 
-    x_train, y_train, x_test, y_test = data
+            self.word_counts = {k: v for k, v in word_counts.items()}
+            if normalize:
+                self.word_counts = {k: self.word_counts[k]/words_sum for k in word_counts.keys()}
+        
+        else:
+            self.word_counts = dict(zip(keys.index2word, [1e-9]*len(keys.index2word)))
+        
+    def _translate(self, X, y=None):
+        
+        all_embeds = []
+        proper_inds = []
+        
+        for i, doc in enumerate(X):
+            
+            vecs = []
+            
+            if isinstance(doc, str):
+                doc = doc.split()
+                
+            for word in doc:
+                
+                if word in self.word_counts and word in self.keys:
+                    
+                    if self.word_counts[word] > self.r and np.random.uniform() < 1 - self.r/self.word_counts[word]:
+                        continue
+                        
+                    vecs.append( self.keys[word] )
+            
+            if not len(vecs):
+                continue
+                
+            if self.mean:
+                vecs = np.mean(np.asarray(vecs), axis=0)
+                
+            proper_inds.append(i)
+            
+            all_embeds.append(vecs)
+            
+            
+        return (np.asarray(all_embeds), [y[i] for i in proper_inds]) if y is not None else all_embeds
     
-    pip = make_pipeline(preprocessor(),
-                        model(**kwargs)
-                       )
+    def fit(self, X, y=None):
+        
+        return self
     
-    pip.fit(x_train, y_train)
-    return get_score(pip, x_train, y_train, x_test, y_test)
-
-
-def prepare_data_to_rnn(data, word2vec):
+    def fit_transform(self, X, y=None):
+        
+        return self._translate(X, y)
     
-    x_train, indices = vectorize_docs(data[0], word2vec, mean=False)
-    y_train = np.asarray(data[1])[indices]
-    
-    x_test, indices = vectorize_docs(data[2], word2vec, mean=False)
-    y_test = np.asarray(data[3])[indices]
-    
-    return x_train, y_train, x_test, y_test
-
-def train_with_loss_history(vectorizer,
-                            data,
-                            tf_model,
-                            vocabulary,
-                            **kwargs):
-    
-    x_train, y_train, x_test, y_test = data
-    pip = make_pipeline(vectorizer(vocabulary=vocabulary), 
-                        dense_transformer()
-                       )
-    
-    pip.fit(x_train)
-    x_test = pip.transform(x_test)
-    mod = tf_model(x_test=x_test, y_test=y_test, **kwargs)
-    mod.fit(pip.transform(x_train), y_train)
-    return get_score(mod, pip.transform(x_train), y_train, x_test, y_test)
-    
+    def transform(self, X, y=None):
+        
+        return self._translate(X, y)
