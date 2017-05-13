@@ -3,6 +3,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 import numpy as np
 from sklearn.base import ClassifierMixin
 from tensorflow.contrib.rnn import LSTMCell, GRUCell, LSTMStateTuple
+from tensorflow.contrib.layers import xavier_initializer
 
 
 def init_normal_var(shape):
@@ -11,6 +12,20 @@ def init_normal_var(shape):
 def init_xavier(shape):
     bound = np.sqrt(6./sum(shape))
     return tf.Variable(tf.random_uniform(shape=shape, minval=-bound, maxval=bound))
+
+def append_zeros(X):
+    
+    N = len(X)
+    E = len(X[0][0])
+    L = list(map(len, X))
+    M = max(L)
+    temp = np.zeros((N, M, E))
+
+    for i in range(N):
+
+        temp[i] = np.concatenate([X[i], np.zeros((M-L[i], E))], axis=0)
+
+    return np.asarray(temp), L
 
 
 class Model(ClassifierMixin):
@@ -87,6 +102,12 @@ class Model(ClassifierMixin):
         
         self.reset = reset_with_new_fit
         
+        if x_test is not None:
+            
+            if 'lengths' in self.placeholders:
+                
+                self.x_test, self._test_lengths = append_zeros(x_test)
+        
     def step_fit(self, X, y, weights=None):
         
         labels, lab_count = np.unique(y, return_counts=True)
@@ -98,17 +119,7 @@ class Model(ClassifierMixin):
         
         if 'lengths' in self.placeholders:
             
-            E = len(X[0][0])
-            L = list(map(len, X))
-            M = max(L)
-            temp = np.zeros((N, M, E))
-            
-            for i in range(N):
-                
-                temp[i] = np.concatenate([X[i], np.zeros((M-L[i], E))], axis=0)
-                
-                
-            X = np.asarray(temp)
+            X, L = append_zeros(X)
             feed_dict = {self.placeholders['lengths']:L}
                 
         feed_dict.update({self.placeholders['inputs']:X, self.placeholders['outputs']:y, self.weights:weights, 
@@ -120,7 +131,7 @@ class Model(ClassifierMixin):
             feed_dict[self.placeholders['training']] = False
             loss = self.sess.run(self.loss, feed_dict=feed_dict)
             feed_dict.update({self.placeholders['inputs']:self.x_test, self.placeholders['outputs']:self.y_test,
-                              self.weights:self.test_weights})
+                              self.weights:self.test_weights, self.placeholders['lengths']:self._test_lengths})
             test_loss = self.sess.run(self.loss, feed_dict)
             self.train_loss.append(loss)
             self.test_loss.append(test_loss)
@@ -139,6 +150,8 @@ class Model(ClassifierMixin):
         weights = np.asarray([N/float(C*lab_count[t]) for t in y]) if self.balance else np.ones(N)
         if self.y_test is not None:
             self.test_weights = np.asarray([N/float(C*lab_count[t]) for t in self.y_test])
+            
+        print('start training', self.iters, 'left')
         while self.iters:
             
             B = random.sample(range(len(X)), self.batch)
@@ -146,6 +159,9 @@ class Model(ClassifierMixin):
             
             self.step_fit(X[B], y[B], weights[B])
             
+            if self.iters % 10 == 0:
+                
+                print('{iters} left, train {train}, test {test}'.format(iters=self.iters, train=np.mean(self.train_loss[-10:]), test=np.mean(self.test_loss[-10:])))
             
             self.iters -= 1
             
@@ -244,8 +260,8 @@ def build_rnn(input_size, output_size, hidden, cell='lstm', average=False, bidir
     
     if bidirectional:
         
-        cell_fw = cells[cell](hidden)
-        cell_bw = cells[cell](hidden)
+        cell_fw = cells[cell](hidden, initializer=xavier_initializer())
+        cell_bw = cells[cell](hidden, initializer=xavier_initializer())
         
         outputs, states = tf.nn.bidirectional_dynamic_rnn(
             cell_fw=cell_fw,
@@ -265,7 +281,7 @@ def build_rnn(input_size, output_size, hidden, cell='lstm', average=False, bidir
         
     else:
         
-        cell_fw = cells[cell](hidden)
+        cell_fw = cells[cell](hidden, initializer=xavier_initializer())
         
         outputs, state = tf.nn.dynamic_rnn(
             cell=cell_fw,

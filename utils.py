@@ -5,8 +5,8 @@ from gensim.models import KeyedVectors
 import numpy as np
 from scipy.stats import entropy
 from sklearn.pipeline import make_pipeline
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.base import ClassifierMixin, TransformerMixin
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold, KFold
+from sklearn.base import ClassifierMixin, TransformerMixin, clone
 from sklearn.feature_selection import SelectKBest
 from sklearn.preprocessing import Normalizer, FunctionTransformer
 from sklearn.metrics import precision_score, recall_score, log_loss, accuracy_score
@@ -114,24 +114,26 @@ def get_score(clf, X, y, cv=10):
     N = len(X)
     s = N//cv
     
-    #X, y = list(map(np.asarray, [X,y]))
+    X, y = list(map(np.asarray, [X,y]))
     
-    scores = defaultdict(list)
-    
-    for i in range(cv):
+    scores = [defaultdict(list), defaultdict(list)]
+    skf = StratifiedKFold(n_splits=cv)
+    for train_index, test_index in skf.split(X, y):
         
-        x_train, x_test, y_train, y_test = train_test_split(X, y)
+        clf.fit(X[train_index], y[train_index])
+        #sparallelizuj to na modłę cross_val_score z sklearn
         
-        clf.fit(x_train, y_train)
-        pred = clf.predict(x_test)
-        probs = clf.predict_proba(x_test)
+        for j, ids in enumerate([train_index, test_index]):
+            
+            probs = clf.predict_proba(X[ids])
+            preds = np.argmax(probs, axis=1)
+            scores[j]['log loss'].append(log_loss( y[ids], probs ))
+            scores[j]['accuracy'].append(accuracy_score( y[ids], preds ))
+            scores[j]['precision'].append( np.mean( test_score_one_vs_all( y[ids], preds, precision_score ) ))
+            scores[j]['recall'].append( np.mean( test_score_one_vs_all( y[ids], preds, recall_score ) ))
+                                         
         
-        scores['log loss'].append( log_loss( y_test, probs ) )
-        scores['accuracy'].append( accuracy_score( y_test, pred ) )
-        scores['precision'].append(test_score_one_vs_all(y_test, pred, precision_score).mean())
-        scores['recall'].append(test_score_one_vs_all(y_test, pred, recall_score).mean())
-        
-    return {k:np.mean(v) for k, v in scores.items()}
+    return [{k:np.mean(v) for k, v in subsc.items()} for subsc in scores]
     
 def train_mlc(vectorizer, model,  data, vocabulary, cv=10, sample_weight=None, **kwargs):
     
@@ -178,6 +180,16 @@ def train_mlc(vectorizer, model,  data, vocabulary, cv=10, sample_weight=None, *
         
     return {k:np.mean(v) for k, v in scores.items()}
     
+def _create_vect_pipeline(vectorizer, 
+                    model, 
+                    vocabulary, 
+                    sample_weight=None,
+                    **kwargs):
+    
+    return make_pipeline(vectorizer(vocabulary=vocabulary), 
+                        dense_transformer(),
+                        model(**kwargs)
+                       )
     
 def train_test_pipeline(vectorizer, 
                         model, 
@@ -186,13 +198,25 @@ def train_test_pipeline(vectorizer,
                         sample_weight=None,
                         **kwargs):
     
-    pip = make_pipeline(vectorizer(vocabulary=vocabulary), 
-                        dense_transformer(),
-                        model(**kwargs)
-                       )
+    pip = _create_vect_pipeline(vectorizer, model, vocabulary)
     
     X, y = data
     return get_score(pip, X, y), pip
+
+def many_models_score(models, X, y, number=None):
+    
+    if not isinstance(models, list):
+        models = [clone(models) for i in range(number)]
+        
+    probs = []
+    for model in models:
+        probs.append( model.predict_proba(X) )
+        
+    probs = np.mean(np.dstack(probs), axis=2)
+    preds = np.argmax(probs, axis=1)
+    return {'log loss': log_loss( y, probs), 'accuracy': accuracy_score( y, preds ), 
+            'precision': test_score_one_vs_all( y, preds, precision_score ).mean(), 
+            'recall': test_score_one_vs_all( y, preds, recall_score ).mean() }
 
 
 def feature_selection_pipeline(vectorizer, 
@@ -215,6 +239,68 @@ def feature_selection_pipeline(vectorizer,
     X, y = data
     X = pip.fit_transform(X, y)
     return get_score(model(**kwargs), np.asarray(X), np.asarray(y)), pip
+
+def divide_into_chunks(X, 
+                       chunk_size):
+    
+    L = len(X)
+    final_matrix = np.zeros((L // chunk_size + 1, X[0].shape[0]))
+    
+    for i in range(L // chunk_size):
+        
+        final_matrix[i, :] = np.mean(np.vstack(X[chunk_size*i:chunk_size*i+chunk_size]), axis=0)
+        
+    final_matrix[-1, :] = np.mean(np.vstack(X[-L%chunk_size:]), axis=0)
+    
+    return final_matrix
+
+def divide_into_sentences(X, keys):
+    
+    sents = [s for s in list(map(purge, X.split('.'))) if len(s)]
+    
+    matrix = np.zeros((len(sents), keys.vector_size))
+    
+    proper_inds = []
+    
+    for i, sent in enumerate(sents):
+        try:
+            matrix[i, :] = np.mean(np.vstack([keys[x] for x in sent.split() if x in keys]), axis=0)
+            proper_inds.append(i)
+        except ValueError:
+            continue
+        
+    return matrix[proper_inds, :]
+    
+    
+def train_models_on_folds(models, X, y, number=None):
+    
+    
+    if not isinstance(models, list):
+        models = [clone(models) for i in range(number)]
+        
+    M = len(models)
+    
+    skf = StratifiedKFold(n_splits=M)
+    X, y = list(map(np.asarray, [X,y]))
+    
+    for m, (train_index, test_index) in enumerate(skf.split(X, y)):
+        
+        #print('training {}-th model'.format(m))
+        models[m].fit( X[train_index], y[train_index] )
+        
+    return models
+
+def train_many_models(models, X, y, number=None):
+    
+    X, y = list(map(np.asarray, [X,y]))
+    
+    if not isinstance(models, list):
+        models = [clone(models) for i in range(number)]
+    
+    for model in models:
+        model.fit( X, y )
+        
+    return models
 
 class DocVectorizer(TransformerMixin):
     
